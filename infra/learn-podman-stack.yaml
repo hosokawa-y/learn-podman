@@ -1,0 +1,162 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  learn-podman 学習用スタック。
+  VPC + パブリックサブネット + IGW + SG + IAMロール(SSM/ECR) + EC2(Ubuntu 24.04 LTS) を一括作成。
+  キーペアは作らず、接続は AWS Systems Manager Session Manager 経由で行う前提。
+  Ubuntu 24.04 LTS を使う理由: AL2023 標準リポジトリに podman が無いため。
+  Ubuntu 24.04 は podman 4.9 (Quadlet 対応) と SSM Agent をプリインストール済みで条件を満たす。
+
+Parameters:
+  MyIp:
+    Type: String
+    Description: 自宅のグローバル IP を CIDR 形式で指定 (例 203.0.113.45/32)。https://ifconfig.me で確認できる
+    AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$
+    ConstraintDescription: CIDR 形式で入力してください (例 203.0.113.45/32)
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+    Description: Ubuntu 24.04 LTS (x86_64) の最新 AMI ID を Canonical 公式 SSM Parameter から自動取得
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t3.micro
+      - t3.small
+    Description: 検証用なので t3.micro 推奨 (無料利用枠)
+
+Resources:
+  # ---- ネットワーク ----
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: learn-podman-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: learn-podman-igw
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: learn-podman-public-subnet
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: learn-podman-public-rt
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # ---- セキュリティグループ (アプリの 8080 のみ自宅 IP に開く) ----
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: learn-podman app access from home only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: !Ref MyIp
+          Description: app port from home IP
+      Tags:
+        - Key: Name
+          Value: learn-podman-sg
+
+  # ---- IAM (SSM 接続 + 後の Phase 3 で ECR pull 用) ----
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+      Tags:
+        - Key: Name
+          Value: learn-podman-role
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
+  # ---- EC2 インスタンス ----
+  AppInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref AppSecurityGroup
+      IamInstanceProfile: !Ref InstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 8
+            VolumeType: gp3
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: learn-podman
+
+Outputs:
+  InstanceId:
+    Description: EC2 インスタンス ID (SSM 接続時の --target に渡す値)
+    Value: !Ref AppInstance
+
+  PublicIp:
+    Description: パブリック IP (停止/起動で変わる点に注意)
+    Value: !GetAtt AppInstance.PublicIp
+
+  AppUrl:
+    Description: アプリ起動後にブラウザ/curl でアクセスする URL
+    Value: !Sub "http://${AppInstance.PublicIp}:8080/"
+
+  SsmConnectCommand:
+    Description: SSM Session Manager で接続するためのコマンド
+    Value: !Sub "aws ssm start-session --target ${AppInstance} --region ${AWS::Region}"

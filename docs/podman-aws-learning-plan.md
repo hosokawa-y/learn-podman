@@ -112,33 +112,48 @@ ENTRYPOINT ["/app"]
 EC2 上で rootless Podman + systemd --user + Quadlet という、Podman らしい構成を実際に動かす。**ここまでで一旦「動くもの」が完成**するので、ひと区切りとして自分なりにまとめる。
 
 ### Day 1: EC2 セットアップとイメージ転送
-- [ ] EC2 起動: Amazon Linux 2023、t3.micro、キーペア用意
-- [ ] SG: SSH(自宅IP のみ)、**TCP/8080 も自宅IP のみ**を first choice にする(0.0.0.0/0 はどうしても外から動作確認したい時の最終手段)
-- [ ] `ssh ec2-user@<ip>` でログイン
-- [ ] `sudo dnf install -y podman`
-- [ ] `podman --version` が 4.4 以上(Quadlet 対応)
-- [ ] **`sudo loginctl enable-linger ec2-user`** ← 忘れない(これが無いと SSH ログアウトでサービスが死ぬ)
-- [ ] **ローカルでクロスビルドしたイメージを EC2 に転送**:
+- [x] **CloudFormation で一括構築**: `infra/learn-podman-stack.yaml` を `aws cloudformation deploy --template-file infra/learn-podman-stack.yaml --stack-name learn-podman --capabilities CAPABILITY_IAM --parameter-overrides MyIp=<自宅IP>/32 --region ap-northeast-1` で適用すると VPC + パブリックサブネット + IGW + SG + IAMロール(SSM/ECR権限付き) + EC2(Ubuntu 24.04 LTS, t3.micro) が一気に作られる。キーペアは作成しない(`ec2:CreateKeyPair` が SCP で Deny される会社環境を前提とし、接続は SSM Session Manager で行う)
+- [x] SG はテンプレートで管理: **TCP/8080 のみを `MyIp` パラメータの自宅 IP に限定して開放**。SSH(22番)は開放しない(キーペアを使わないため不要)
+- [x] **SSM Session Manager で接続**: 手元の macOS に `brew install --cask session-manager-plugin` を入れてから、`aws cloudformation describe-stacks --stack-name learn-podman --query "Stacks[0].Outputs" --output table` で `InstanceId` を確認し、`aws ssm start-session --target <InstanceId> --region ap-northeast-1` で接続。入った直後は `ssm-user` なので `sudo su - ubuntu` でデフォルトユーザーに切り替える
+- [x] `sudo apt update && sudo apt install -y podman awscli`(Ubuntu 24.04 LTS の podman は 4.9 系で Quadlet 対応 / awscli は universe の v1 系。EC2 上で ECR ログインするために必要)
+- [x] `podman --version` が 4.4 以上(Quadlet 対応)
+- [x] **`sudo loginctl enable-linger ubuntu`** ← 忘れない(これが無いと SSM セッション切断でサービスが死ぬ)
+- [ ] **ECR 経由でイメージを EC2 に届ける**(SSH を開けていないので `save | ssh load` は使えない。Phase 3 で詳しくやる ECR push をここで先取りする):
+
+  手元 (macOS) で ECR にリポジトリ作成 → ログイン → push:
   ```bash
-  # 手元(macOS arm64)で
-  podman save myapp:0.1.0-amd64 | ssh ec2-user@<ip> 'podman load'
+  aws ecr create-repository --repository-name myapp --region ap-northeast-1
+
+  aws ecr get-login-password --region ap-northeast-1 | \
+    podman login --username AWS --password-stdin <account>.dkr.ecr.ap-northeast-1.amazonaws.com
+
+  podman tag myapp:0.1.0-amd64 <account>.dkr.ecr.ap-northeast-1.amazonaws.com/myapp:0.1.0
+  podman push <account>.dkr.ecr.ap-northeast-1.amazonaws.com/myapp:0.1.0
   ```
-  これで EC2 上で `podman images` に `myapp:0.1.0-amd64` が現れる。Phase 3 で ECR push に置き換えるので、ここでは「動かす」ことを優先する素朴な転送で OK。
-- [ ] EC2 上で `podman run --rm -p 8080:8080 myapp:0.1.0-amd64` で単発起動できることを先に確認
+
+  EC2 (ubuntu ユーザー) で ECR にログインして pull:
+  ```bash
+  aws ecr get-login-password --region ap-northeast-1 | \
+    podman login --username AWS --password-stdin <account>.dkr.ecr.ap-northeast-1.amazonaws.com
+
+  podman pull <account>.dkr.ecr.ap-northeast-1.amazonaws.com/myapp:0.1.0
+  ```
+  ※ ECR ログイントークンは 12 時間で失効する。Phase 3 で `amazon-ecr-credential-helper` に置き換えて自動化する。EC2 側の IAM インスタンスプロファイル(CFn テンプレートで `AmazonEC2ContainerRegistryReadOnly` を付与済み)が AWS CLI の認証情報源として効くので、追加の認証情報設定は不要。
+- [ ] EC2 上で `podman run --rm -p 8080:8080 <account>.dkr.ecr.ap-northeast-1.amazonaws.com/myapp:0.1.0` で単発起動できることを確認
 
 ### Day 2: Quadlet で systemd 化
 - [ ] `~/.config/containers/systemd/myapp.container` を作成
 - [ ] `systemctl --user daemon-reload`
 - [ ] `systemctl --user start myapp.service`
 - [ ] `systemctl --user status myapp.service` で active 確認
-- [ ] `curl http://<public-ip>:8080/` で外部から疎通(SG で自宅IPに絞っている前提)
+- [ ] `curl http://<public-ip>:8080/` で外部から疎通(SG で自宅IPに絞っている前提。`<public-ip>` は `aws cloudformation describe-stacks --stack-name learn-podman --query "Stacks[0].Outputs[?OutputKey=='PublicIp'].OutputValue" --output text` で取得)
 - [ ] `podman kill` で殺してみる → 自動復活すれば Restart=always が効いている
 - [ ] `sudo reboot` → 再ログイン後、自動起動していれば linger が効いている
 
 ### 確認ポイント
 - [ ] `/usr/libexec/podman/quadlet -dryrun -user` で生成された unit を読んでみる
 - [ ] `journalctl --user -u myapp.service` でログが追える
-- [ ] SSH ログアウトしてもサービスが動き続ける
+- [ ] SSM セッションを切断してもサービスが動き続ける(linger が効いている証拠)
 
 ### この時点での到達レベル
 「Linux サーバー上でコンテナをサービスとして動かす」感覚が掴めている状態。**ここで小休止して、blog の下書きにしてもよい**。
@@ -313,7 +328,7 @@ Internet ─→ :443 Caddy(TLS終端) ─→ myapp:8080
 
 | Phase | 開始日 | 完了日 | メモ |
 |------|--------|--------|------|
-| 0    |        |        |      |
+| 0    |2026/05/15|2026/05/15|学習計画 121 行目「ECR 経由でイメージを EC2 に届ける」の手前まで完了|
 | 1    |        |        |      |
 | 2    |        |        |      |
 | 3    |        |        |      |
